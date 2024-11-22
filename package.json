@@ -1,5 +1,5 @@
 {
-  "name": "@thant/ciphersuite",
+  "name": "@thant-dev/ciphersuite",
   "version": "1.0.0",
   "description": "A suite of cryptographic utilities, including signal protocol, AES, and public key encryption for secure messaging.",
   "main": "./dist/index.js",
@@ -15,6 +15,9 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/thantsintoe/ciphersuite.git"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "keywords": [
     "cryptography",

@@ -1,4 +1,4 @@
-# @thant/ciphersuite
+# Ciphersuite for E2E message encryption
 
 A suite of cryptographic utilities, including secp256k1, AES, and Salsa for secure messaging. This library implements the Signal Double Ratchet protocol for end-to-end encrypted communication. It also provides handy utilities from the `@noble/secp256k1` library.
 
@@ -7,12 +7,12 @@ A suite of cryptographic utilities, including secp256k1, AES, and Salsa for secu
 To use this library in your Vue.js or React.js project, you can install it via npm:
 
 ```bash
-npm install @thant/ciphersuite
+npm install @thant-dev/ciphersuite
 ```
 
 ## Usage in Vue.js
 
-Here's a simple example of how you can use `@thant/ciphersuite` in a Vue.js project.
+Here's a simple example of how you can use `@thant-dev/ciphersuite` in a Vue.js project.
 
 ```javascript
 <template>
@@ -25,7 +25,7 @@ Here's a simple example of how you can use `@thant/ciphersuite` in a Vue.js proj
 </template>
 
 <script>
-import { Ratchet, getPublicKey, secpUtils } from '@thant/ciphersuite';
+import { Ratchet, getPublicKey, secpUtils } from '@thant-dev/ciphersuite';
 
 export default {
   name: 'SecureMessagingComponent',
@@ -72,11 +72,11 @@ export default {
 
 ## Usage in React.js
 
-You can also use `@thant/ciphersuite` in a React.js project. Below is a simple usage example with React hooks.
+You can also use `@thant-dev/ciphersuite` in a React.js project. Below is a simple usage example with React hooks.
 
 ```javascript
 import React, { useState } from 'react';
-import { Ratchet, getPublicKey, secpUtils } from '@thant/ciphersuite';
+import { Ratchet, getPublicKey, secpUtils } from '@thant-dev/ciphersuite';
 
 const SecureMessagingComponent = () => {
   const [ratchetInstance, setRatchetInstance] = useState(null);
