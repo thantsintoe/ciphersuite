@@ -1,0 +1,33 @@
+{
+  "name": "@thant/ciphersuite",
+  "version": "1.0.0",
+  "description": "A suite of cryptographic utilities, including signal protocol, AES, and public key encryption for secure messaging.",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist/**/*"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thantsintoe/ciphersuite.git"
+  },
+  "keywords": [
+    "cryptography",
+    "cipher",
+    "encryption",
+    "secure-messaging",
+    "secp256k1",
+    "AES",
+    "Salsa20"
+  ],
+  "author": "Thant Sin",
+  "license": "MIT",
+  "dependencies": {
+    "@noble/secp256k1": "^1.0.0"
+  }
+}
