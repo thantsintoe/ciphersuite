@@ -1,8 +1,7 @@
 import { expect } from "chai";
 import { Ratchet } from "../dist/core/signal.js";
 import { getPublicKey, utils as secpUtils } from "@noble/secp256k1";
-
-import { webcrypto } from "crypto"; // Node.js's Web Crypto API
+import { webcrypto } from "crypto";
 
 // Polyfill for getRandomValues
 if (!globalThis.crypto) {
@@ -12,7 +11,7 @@ if (!globalThis.crypto) {
 // Helper function to generate key pairs
 async function generateKeyPair() {
   const privateKey = secpUtils.randomPrivateKey();
-  const publicKey = getPublicKey(privateKey, true);
+  const publicKey = getPublicKey(privateKey, false);
   return { privateKey, publicKey };
 }
 
@@ -38,12 +37,12 @@ describe("Ratchet Class", () => {
   });
 
   it("should fail to initialize with invalid remote public key", async () => {
-    const invalidKey = new Uint8Array(32); // 32 bytes instead of 33
+    const invalidKey = new Uint8Array(64); // 64 bytes instead of 65
     try {
       await aliceRatchet.initialize(invalidKey);
     } catch (error) {
       expect(error.message).to.equal(
-        "Invalid remote public key length. Expected 33 bytes (compressed format)"
+        "Invalid remote public key length. Expected 65 bytes (compressed format)"
       );
     }
   });

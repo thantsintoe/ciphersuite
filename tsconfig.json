@@ -1,12 +1,13 @@
 {
   "compilerOptions": {
-    "outDir": "./dist", // Output compiled files to the 'dist' folder
-    "module": "CommonJS", // Use CommonJS for compatibility
-    "target": "ES6", // Target ES6 for modern JavaScript features
-    "strict": true, // Enable all strict type-checking options
-    "esModuleInterop": true, // Required for importing CommonJS modules cleanly
-    "declaration": true, // Generate .d.ts files for TypeScript types
-    "sourceMap": true // Include source maps for debugging
+    "outDir": "./dist",
+    "module": "ES2020",        // Changed from CommonJS
+    "target": "ES2020",        // Updated to match
+    "strict": true,
+    "esModuleInterop": true,
+    "declaration": true,
+    "sourceMap": true,
+    "moduleResolution": "node"  // Add this
   },
   "include": [
     "src/**/*"
