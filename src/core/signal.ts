@@ -40,6 +40,18 @@ export interface RatchetState {
   previousChainLength: number;
   needToRatchet: boolean;
   isFirstMessage: boolean;
+  sentPublicKeys: string[];
+  // Add cache states
+  messageKeyCache: {
+    [chainKey: string]: {
+      [messageNumber: number]: string // hex string of Uint8Array
+    }
+  };
+  sentMessageKeyCache: {
+    [chainKey: string]: {
+      [messageNumber: number]: string // hex string of Uint8Array
+    }
+  };
 }
 
 export class Ratchet {
@@ -62,6 +74,8 @@ export class Ratchet {
   private recvMessageNumber: number;
   private previousChainLength: number;
   private messageKeyCache: Map<string, Map<number, Uint8Array>>; // chainKey -> messageNumber -> messageKey
+  private sentMessageKeyCache: Map<string, Map<number, Uint8Array>>; // For storing our own sent message keys
+  private sentPublicKeys: Set<string>; // Track our sent message public keys
 
   private readonly MAX_SKIP = 1000; // Maximum number of skipped messages
   private readonly MAX_CACHE_SIZE = 2000; // Maximum size of message key cache
@@ -79,7 +93,7 @@ export class Ratchet {
     // TypeScript type assertion
     this.crypto = globalCrypto as Crypto;
     this.subtle = this.crypto.subtle;
-    this.verboseLog = options.verboseLog || false;
+    this.verboseLog = options.verboseLog || true;
 
     // Validate keypair
     if (
@@ -126,6 +140,8 @@ export class Ratchet {
     this.recvMessageNumber = 0;
     this.previousChainLength = 0;
     this.messageKeyCache = new Map();
+    this.sentMessageKeyCache = new Map(); // Add sent message key cache
+    this.sentPublicKeys = new Set();
   }
 
   private async hkdf(
@@ -250,8 +266,8 @@ export class Ratchet {
     return uint8ArrayToHexString(chainKey);
   }
 
-  private async storeMessageKey(chainKey: Uint8Array, messageNumber: number, messageKey: Uint8Array) {
-    const cacheKey = this.getCacheKey(chainKey);
+  private async storeMessageKey(dhPublicKey: Uint8Array, messageNumber: number, messageKey: Uint8Array) {
+    const cacheKey = this.getCacheKey(dhPublicKey);
     if (!this.messageKeyCache.has(cacheKey)) {
       this.messageKeyCache.set(cacheKey, new Map());
     }
@@ -259,41 +275,17 @@ export class Ratchet {
     const chainCache = this.messageKeyCache.get(cacheKey)!;
     chainCache.set(messageNumber, messageKey);
 
-    // Schedule cleanup after TTL
-    setTimeout(() => {
-      chainCache.delete(messageNumber);
-      if (chainCache.size === 0) {
-        this.messageKeyCache.delete(cacheKey);
-      }
-    }, this.MESSAGE_KEY_TTL);
+    // Add timestamp to track TTL
+    const timestamp = Date.now();
+    chainCache.set(messageNumber, messageKey);
 
     // Enforce cache size limit
     if (chainCache.size > this.MAX_CACHE_SIZE) {
-      // Remove oldest keys
       const sortedKeys = Array.from(chainCache.keys()).sort((a, b) => a - b);
       while (chainCache.size > this.MAX_CACHE_SIZE) {
         chainCache.delete(sortedKeys.shift()!);
       }
     }
-  }
-
-  private async skipMessageKeys(chainKey: Uint8Array, until: number): Promise<Uint8Array> {
-    if (this.verboseLog) console.log(`Skipping ${until} message keys`);
-    let curr = chainKey;
-
-    if (until > this.MAX_SKIP) {
-      throw new Error(`Too many skipped messages: ${until}`);
-    }
-
-    for (let i = 0; i < until; i++) {
-      // Store skipped message key
-      const messageKey = await this.kdfMessageKey(curr);
-      await this.storeMessageKey(curr, i, messageKey);
-
-      // Advance chain key
-      curr = await this.kdfChainKey(curr);
-    }
-    return curr;
   }
 
   public async encrypt(plaintext: string): Promise<EncryptedMessage> {
@@ -305,7 +297,9 @@ export class Ratchet {
     this.privateKey = secp256k1.utils.randomPrivateKey();
     this.publicKey = secp256k1.getPublicKey(this.privateKey, false);
 
-    if (this.verboseLog) console.log(`Generated new DH key pair for encrypting message.`);
+    // Track this public key as one we used for sending
+    this.sentPublicKeys.add(uint8ArrayToHexString(this.publicKey));
+    if (this.verboseLog) console.log(`Generated new DH key pair for encrypting message.`, this.privateKey, this.remotePublicKey);
 
     // Perform a Diffie-Hellman ratchet step
     const sharedPoint = secp256k1.getSharedSecret(
@@ -339,6 +333,8 @@ export class Ratchet {
     if (messageKey.length !== 32) {
       throw new Error("Derived message key length is invalid");
     }
+    // Store the message key with the public key as cache key for later decryption
+    await this.storeSentMessageKey(this.publicKey, messageNumber, messageKey);
 
     // Generate a 12-byte IV for AES-GCM encryption
     const iv = this.crypto.getRandomValues(new Uint8Array(12));
@@ -383,9 +379,7 @@ export class Ratchet {
     }
 
     if (packet.dhPublicKey.length !== 65) {
-      throw new Error(
-        "Invalid public key length. Expected 65 bytes (compressed format)"
-      );
+      throw new Error("Invalid public key length. Expected 65 bytes (uncompressed format)");
     }
 
     if (packet.iv.length !== 12) {
@@ -396,22 +390,59 @@ export class Ratchet {
       throw new Error("Empty ciphertext");
     }
 
+    try {
+      let messageKey: Uint8Array | undefined;
+
+      if (this.isSentMessage(packet)) {
+        if (this.verboseLog) console.log(`Decrypting own message #${packet.messageNumber}`);
+
+        // Use the message's DH public key as cache key
+        const cacheKey = uint8ArrayToHexString(packet.dhPublicKey);
+        if (this.verboseLog) console.log(`Cache key: ${cacheKey}`);
+        const chainCache = this.sentMessageKeyCache.get(cacheKey);
+        messageKey = chainCache?.get(packet.messageNumber);
+
+        if (!messageKey) {
+          throw new Error("Sent message key not found in cache");
+        }
+      } else {
+        if (this.verboseLog) console.log(`Decrypting received message #${packet.messageNumber}`);
+        const decrypted = await this.decryptReceivedMessage(packet);
+        return decrypted;
+      }
+
+      // Decrypt the message using the found message key
+      const decKey = await this.subtle.importKey(
+        "raw",
+        messageKey,
+        {name: "AES-GCM"},
+        false,
+        ["decrypt"]
+      );
+
+      const decryptedData = await this.subtle.decrypt(
+        {name: "AES-GCM", iv: packet.iv},
+        decKey,
+        packet.ciphertext
+      );
+
+      const decoder = new TextDecoder();
+      return decoder.decode(decryptedData).trim();
+    } catch (error) {
+      console.error('Decryption failed:', error);
+      throw new Error(
+        error instanceof Error
+          ? error.message
+          : "Decryption failed due to incorrect key or corrupted message data"
+      );
+    }
+  }
+
+  private async decryptReceivedMessage(packet: EncryptedMessage): Promise<string> {
     // Backup current state to revert in case of failure
     const oldRootKey = this.rootKey ? new Uint8Array(this.rootKey) : null;
-    const oldRecvChainKey = this.recvChainKey
-      ? new Uint8Array(this.recvChainKey)
-      : null;
-    const oldRemotePublicKey = this.remotePublicKey
-      ? new Uint8Array(this.remotePublicKey)
-      : null;
-
-    let newRootKey = this.rootKey;
-    let newRecvChainKey = this.recvChainKey;
-    let newRemotePublicKey = this.remotePublicKey;
-
-    const keysAreDifferent =
-      !this.remotePublicKey ||
-      !this.areBuffersEqual(packet.dhPublicKey, this.remotePublicKey);
+    const oldRecvChainKey = this.recvChainKey ? new Uint8Array(this.recvChainKey) : null;
+    const oldRemotePublicKey = this.remotePublicKey ? new Uint8Array(this.remotePublicKey) : null;
 
     try {
       // Save current state before any changes
@@ -424,21 +455,36 @@ export class Ratchet {
         previousChainLength: this.previousChainLength
       };
 
-      // Check if this is an out-of-order message
-      if (packet.messageNumber > this.recvMessageNumber) {
-        if (this.verboseLog) console.log(`Out-of-order message received. Skipping ${packet.messageNumber - this.recvMessageNumber} messages.`);
+      const keysAreDifferent = !this.remotePublicKey ||
+        !this.areBuffersEqual(packet.dhPublicKey, this.remotePublicKey);
+
+      // Check if this is an out-of-order message, but skip check for first message
+      const isFirstMessage = packet.messageNumber === 0;
+      if (this.verboseLog) console.log(`isFirstMessage: ${isFirstMessage}`);
+      if (!isFirstMessage && packet.messageNumber > this.recvMessageNumber) {
+        if (this.verboseLog) {
+          console.log(
+            `Out-of-order message received. Skipping ${
+              packet.messageNumber - this.recvMessageNumber
+            } messages.`
+          );
+        }
         // Store current state and throw error
-        await this.storeMessageKey(
-          this.recvChainKey!,
-          packet.messageNumber,
-          await this.kdfMessageKey(this.recvChainKey!)
-        );
+        if (this.recvChainKey) {
+          await this.storeMessageKey(
+            packet.dhPublicKey, // Use DH public key instead of chain key
+            packet.messageNumber,
+            await this.kdfMessageKey(this.recvChainKey)
+          );
+        }
         throw new Error("Message received out of order");
       }
+
+      // Handle DH ratchet step if needed
       if (keysAreDifferent) {
-        if (this.verboseLog) console.log(
-          `Keys are different. Generating new shared secret and ratcheting.`
-        );
+        if (this.verboseLog) {
+          console.log("Keys are different. Generating new shared secret and ratcheting.");
+        }
 
         // Compute new shared secret using received public key and current private key
         const sharedPoint = secp256k1.getSharedSecret(
@@ -469,30 +515,47 @@ export class Ratchet {
       }
 
       // Try to find message key in cache first
-      const cacheKey = this.getCacheKey(this.recvChainKey!);
+      const cacheKey = this.getCacheKey(packet.dhPublicKey);
       const chainCache = this.messageKeyCache.get(cacheKey);
       let messageKey = chainCache?.get(packet.messageNumber);
 
+      if (chainCache) {
+        if (this.verboseLog) {
+          console.log(`Message key found in cache for message #${packet.messageNumber} and publicKey: ${uint8ArrayToHexString(packet.dhPublicKey)}`);
+        }
+      }
+
       if (!messageKey) {
-        if (packet.messageNumber < this.recvMessageNumber) {
+        if (!isFirstMessage && packet.messageNumber < this.recvMessageNumber) {
           // Restore previous state and try again
           Object.assign(this, savedState);
+          if (this.verboseLog) console.log(`Restored state after decryption failure. packet.messageNumber: ${packet.messageNumber}, this.recvMessageNumber: ${this.recvMessageNumber}`);
           throw new Error("Message from old chain that we don't have cached");
         }
 
+        // Generate new message key and advance chain
         messageKey = await this.kdfMessageKey(this.recvChainKey!);
         this.recvChainKey = await this.kdfChainKey(this.recvChainKey!);
         this.recvMessageNumber = packet.messageNumber + 1;
+
+        // Store the message key with DH public key as cache key
+        await this.storeMessageKey(packet.dhPublicKey, packet.messageNumber, messageKey);
+      } else {
+
       }
 
       if (messageKey.length !== 32) {
         throw new Error("Derived message key length is invalid");
       }
 
-
-      // @ts-ignore
-      if (this.verboseLog) console.log(`Decrypting with received chain key: ${Buffer.from(this.recvChainKey).toString("hex")}`);
-      if (this.verboseLog) console.log(`Decrypt with message key: ${Buffer.from(messageKey).toString("hex")}`);
+      if (this.verboseLog) {
+        console.log(`Decrypting with received chain key: ${
+          Buffer.from(this.recvChainKey!).toString("hex")
+        }`);
+        console.log(`Decrypt with message key: ${
+          Buffer.from(messageKey).toString("hex")
+        }`);
+      }
 
       // Import message key for decryption
       const decKey = await this.subtle.importKey(
@@ -512,9 +575,8 @@ export class Ratchet {
 
       // Return the decrypted plaintext
       const decoder = new TextDecoder();
-      return decoder.decode(decryptedData).trim(); // Trim the fallback space
+      return decoder.decode(decryptedData).trim();
     } catch (error) {
-
       if (this.verboseLog) {
         console.error(
           `Decryption failed due to incorrect key or corrupted message data. Reverting the receive chain key to: ${
@@ -527,20 +589,128 @@ export class Ratchet {
 
       // Revert to the previous state if decryption fails
       this.rootKey = oldRootKey ? new Uint8Array(oldRootKey) : null;
-      this.recvChainKey = oldRecvChainKey
-        ? new Uint8Array(oldRecvChainKey)
-        : null;
-      this.remotePublicKey = oldRemotePublicKey
-        ? new Uint8Array(oldRemotePublicKey)
-        : null;
+      this.recvChainKey = oldRecvChainKey ? new Uint8Array(oldRecvChainKey) : null;
+      this.remotePublicKey = oldRemotePublicKey ? new Uint8Array(oldRemotePublicKey) : null;
 
-      throw new Error(
-        "Decryption failed due to incorrect key or corrupted message data"
-      );
+      throw error;
+    }
+  }
+
+  private async storeSentMessageKey(
+    dhPublicKey: Uint8Array,
+    messageNumber: number,
+    messageKey: Uint8Array
+  ) {
+    const cacheKey = uint8ArrayToHexString(dhPublicKey);
+    if (!this.sentMessageKeyCache.has(cacheKey)) {
+      this.sentMessageKeyCache.set(cacheKey, new Map());
+    }
+
+    const chainCache = this.sentMessageKeyCache.get(cacheKey)!;
+    chainCache.set(messageNumber, messageKey);
+
+    // Enforce cache size limit
+    if (chainCache.size > this.MAX_CACHE_SIZE) {
+      const sortedKeys = Array.from(chainCache.keys()).sort((a, b) => a - b);
+      while (chainCache.size > this.MAX_CACHE_SIZE) {
+        chainCache.delete(sortedKeys.shift()!);
+      }
+    }
+  }
+
+  // Add method to check if a message was sent by us
+  public isSentMessage(packet: EncryptedMessage): boolean {
+    return this.sentPublicKeys.has(uint8ArrayToHexString(packet.dhPublicKey));
+  }
+
+  public restoreState(state: RatchetState): void {
+    if (!state) {
+      throw new Error("No state provided for restoration");
+    }
+
+    // Restore basic properties
+    this.rootKey = state.rootKey;
+    this.sendChainKey = state.sendChainKey;
+    this.recvChainKey = state.recvChainKey;
+    this.remotePublicKey = state.remotePublicKey;
+    this.sendMessageNumber = state.sendMessageNumber;
+    this.recvMessageNumber = state.recvMessageNumber;
+    this.previousChainLength = state.previousChainLength;
+    this.needToRatchet = state.needToRatchet;
+    this.isFirstMessage = state.isFirstMessage;
+    this.sentPublicKeys = new Set(state.sentPublicKeys);
+
+    // Restore message key caches
+    this.messageKeyCache = new Map(
+      Object.entries(state.messageKeyCache).map(([chainKey, messages]) => [
+        chainKey,
+        new Map(
+          Object.entries(messages).map(([msgNum, keyHex]) => [
+            parseInt(msgNum),
+            new Uint8Array(Buffer.from(keyHex, 'hex'))
+          ])
+        )
+      ])
+    );
+
+    // Restore sent message key cache
+    this.sentMessageKeyCache = new Map(
+      Object.entries(state.sentMessageKeyCache).map(([chainKey, messages]) => [
+        chainKey,
+        new Map(
+          Object.entries(messages).map(([msgNum, keyHex]) => [
+            parseInt(msgNum),
+            new Uint8Array(Buffer.from(keyHex, 'hex'))
+          ])
+        )
+      ])
+    );
+
+    if (this.verboseLog) {
+      console.log('Restored ratchet state with caches:', {
+        rootKey: this.rootKey ? uint8ArrayToHexString(this.rootKey) : null,
+        sendChainKey: this.sendChainKey ? uint8ArrayToHexString(this.sendChainKey) : null,
+        recvChainKey: this.recvChainKey ? uint8ArrayToHexString(this.recvChainKey) : null,
+        remotePublicKey: this.remotePublicKey ? uint8ArrayToHexString(this.remotePublicKey) : null,
+        sendMessageNumber: this.sendMessageNumber,
+        recvMessageNumber: this.recvMessageNumber,
+        previousChainLength: this.previousChainLength,
+        needToRatchet: this.needToRatchet,
+        isFirstMessage: this.isFirstMessage,
+        sentPublicKeysCount: this.sentPublicKeys.size,
+        messageKeyCacheSize: this.messageKeyCache.size,
+        sentMessageKeyCacheSize: this.sentMessageKeyCache.size
+      });
+      console.log(`State after restoration:`, this.getState());
     }
   }
 
   public getState(): RatchetState {
+    // Convert message key caches to serializable format using Object.fromEntries
+    const messageKeyCache = Object.fromEntries(
+      Array.from(this.messageKeyCache.entries()).map(([chainKey, messages]) => [
+        chainKey,
+        Object.fromEntries(
+          Array.from(messages.entries()).map(([msgNum, keyBytes]) => [
+            msgNum,
+            uint8ArrayToHexString(keyBytes)
+          ])
+        )
+      ])
+    );
+
+    const sentMessageKeyCache = Object.fromEntries(
+      Array.from(this.sentMessageKeyCache.entries()).map(([chainKey, messages]) => [
+        chainKey,
+        Object.fromEntries(
+          Array.from(messages.entries()).map(([msgNum, keyBytes]) => [
+            msgNum,
+            uint8ArrayToHexString(keyBytes)
+          ])
+        )
+      ])
+    );
+
     return {
       rootKey: this.rootKey,
       sendChainKey: this.sendChainKey,
@@ -551,7 +721,32 @@ export class Ratchet {
       sendMessageNumber: this.sendMessageNumber,
       recvMessageNumber: this.recvMessageNumber,
       previousChainLength: this.previousChainLength,
+      sentPublicKeys: Array.from(this.sentPublicKeys),
+      messageKeyCache,
+      sentMessageKeyCache
     };
+  }
+
+  public cloneState(): RatchetState {
+    return {
+      rootKey: this.rootKey ? new Uint8Array(this.rootKey) : null,
+      sendChainKey: this.sendChainKey ? new Uint8Array(this.sendChainKey) : null,
+      recvChainKey: this.recvChainKey ? new Uint8Array(this.recvChainKey) : null,
+      remotePublicKey: this.remotePublicKey ? new Uint8Array(this.remotePublicKey) : null,
+      sendMessageNumber: this.sendMessageNumber,
+      recvMessageNumber: this.recvMessageNumber,
+      previousChainLength: this.previousChainLength,
+      needToRatchet: this.needToRatchet,
+      isFirstMessage: this.isFirstMessage,
+      sentPublicKeys: Array.from(this.sentPublicKeys),
+      messageKeyCache: this.getState().messageKeyCache, // Use getState to get serializable format
+      sentMessageKeyCache: this.getState().sentMessageKeyCache
+    };
+  }
+
+  // Add helper method to convert public key to/from string
+  private publicKeyToString(pubKey: Uint8Array): string {
+    return uint8ArrayToHexString(pubKey);
   }
 
   private areBuffersEqual(buf1: Uint8Array, buf2: Uint8Array): boolean {

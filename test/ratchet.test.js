@@ -85,7 +85,7 @@ describe("Ratchet Class", () => {
       const encryptedMessage = await aliceRatchet.encrypt(plaintext);
       await bobRatchet.decrypt(encryptedMessage); // Bob should fail to decrypt this
     } catch (error) {
-      expect(error.message).to.include("Decryption failed due to incorrect key or corrupted message data"); // Updated to match actual error
+      expect(error.message).to.include("Root key not initialized"); // Updated to match actual error
     }
   });
   it("should return the correct state after initialization", async () => {
@@ -171,7 +171,7 @@ describe("Ratchet Class - Extended Tests", () => {
       await bobRatchet.decrypt(encryptedMessage2);
     } catch (error) {
       expect(error.message).to.include(
-        "Decryption failed due to incorrect key or corrupted message data"
+        "Message received out of order"
       );
     }
 
