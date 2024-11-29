@@ -23,6 +23,7 @@ export interface RatchetOptions {
   keyPair: KeyPair;
   isInitiator: boolean;
   verboseLog?: boolean;
+  revertStateOnFailure?: boolean
 }
 
 export interface MessageCounter {
@@ -31,16 +32,19 @@ export interface MessageCounter {
 }
 
 export interface RatchetState {
-  rootKey: Uint8Array | null;
-  sendChainKey: Uint8Array | null;
-  recvChainKey: Uint8Array | null;
-  remotePublicKey: Uint8Array | null;
+  rootKey: Uint8Array;
+  sendChainKey: Uint8Array;
+  recvChainKey: Uint8Array;
+  remotePublicKey: Uint8Array;
   sendMessageNumber: number;
   recvMessageNumber: number;
   previousChainLength: number;
   needToRatchet: boolean;
   isFirstMessage: boolean;
+  isInitiator: boolean;
   sentPublicKeys: string[];
+  currentDHPublicKey: Uint8Array;
+  currentDHPrivateKey: Uint8Array;
   // Add cache states
   messageKeyCache: {
     [chainKey: string]: {
@@ -58,17 +62,21 @@ export class Ratchet {
   private readonly crypto: Crypto;
   private readonly subtle: SubtleCrypto;
 
-  private publicKey: Uint8Array;
-  private privateKey: Uint8Array;
-  private rootKey: Uint8Array | null;
-  private sendChainKey: Uint8Array | null;
-  private recvChainKey: Uint8Array | null;
-  private remotePublicKey: Uint8Array | null;
+  private initialPublicKey: Uint8Array;
+  private initialPrivateKey: Uint8Array;
+  private currentDHPublicKey: Uint8Array;
+  private currentDHPrivateKey: Uint8Array;
+  private rootKey: Uint8Array;
+  private sendChainKey: Uint8Array;
+  private recvChainKey: Uint8Array;
+  private remotePublicKey: Uint8Array;
 
-  private readonly isInitiator: boolean;
+  private isInitiator: boolean;
   private needToRatchet: boolean;
   private isFirstMessage: boolean;
   private verboseLog: boolean;
+  private debugLog: boolean
+  private revertStateOnFailure: boolean;
 
   private sendMessageNumber: number;
   private recvMessageNumber: number;
@@ -94,6 +102,8 @@ export class Ratchet {
     this.crypto = globalCrypto as Crypto;
     this.subtle = this.crypto.subtle;
     this.verboseLog = options.verboseLog || true;
+    this.debugLog = false
+    this.revertStateOnFailure = options.revertStateOnFailure || true;
 
     // Validate keypair
     if (
@@ -124,16 +134,21 @@ export class Ratchet {
       throw new Error("Public key does not match private key");
     }
 
-    this.publicKey = options.keyPair.publicKey;
-    this.privateKey = options.keyPair.privateKey;
+    // Store initial keypair
+    this.initialPublicKey = options.keyPair.publicKey;
+    this.initialPrivateKey = options.keyPair.privateKey;
 
-    this.rootKey = null;
-    this.sendChainKey = null;
-    this.recvChainKey = null;
-    this.remotePublicKey = null;
+    // Initialize DH keys as null
+    this.currentDHPublicKey = options.keyPair.publicKey
+    this.currentDHPrivateKey = options.keyPair.privateKey
+
+    this.rootKey = new Uint8Array(32);
+    this.sendChainKey = new Uint8Array(32);
+    this.recvChainKey = new Uint8Array(32);
+    this.remotePublicKey = new Uint8Array(32);
 
     this.isInitiator = options.isInitiator;
-    this.needToRatchet = false;
+    this.needToRatchet = this.isInitiator ? true : false;
     this.isFirstMessage = true;
 
     this.sendMessageNumber = 0;
@@ -174,7 +189,7 @@ export class Ratchet {
   }
 
   private async kdfRoot(
-    rootKey: Uint8Array | null,
+    rootKey: Uint8Array,
     dhOutput: Uint8Array
   ): Promise<{ newRootKey: Uint8Array; newChainKey: Uint8Array }> {
     const salt = rootKey || new Uint8Array(32);
@@ -233,29 +248,30 @@ export class Ratchet {
 
     // Compute shared secret using ECDH with secp256k1
     const sharedPoint = secp256k1.getSharedSecret(
-      this.privateKey,
+      this.initialPrivateKey,
       this.remotePublicKey
     );
     // Use only the x-coordinate (first 32 bytes) as the shared secret
     const sharedSecret = sharedPoint.slice(1, 33);
 
     // Derive initial root key and chain key
-    const { newRootKey, newChainKey } = await this.kdfRoot(null, sharedSecret);
+    const {newRootKey, newChainKey} = await this.kdfRoot(new Uint8Array(32), sharedSecret);
     this.rootKey = newRootKey;
 
-    if (this.verboseLog) if (this.verboseLog) console.log("Root key", uint8ArrayToHexString(this.rootKey));
-    if (this.verboseLog) console.log("Chain key", uint8ArrayToHexString(newChainKey));
+    if (this.debugLog) console.log("Initializing: Root key", uint8ArrayToHexString(this.rootKey));
+    if (this.debugLog) console.log("Initializing: Chain key", uint8ArrayToHexString(newChainKey));
 
     if (this.isInitiator) {
       this.sendChainKey = newChainKey;
       this.needToRatchet = true;
-      if (this.verboseLog) console.log(
+      if (this.debugLog) console.log(
         "Initiator: send chain key",
         uint8ArrayToHexString(this.sendChainKey)
       );
     } else {
       this.recvChainKey = newChainKey;
-      if (this.verboseLog) console.log(
+      this.needToRatchet = false
+      if (this.debugLog) console.log(
         "Non-initiator: receive chain key",
         uint8ArrayToHexString(this.recvChainKey)
       );
@@ -266,7 +282,7 @@ export class Ratchet {
     return uint8ArrayToHexString(chainKey);
   }
 
-  private async storeMessageKey(dhPublicKey: Uint8Array, messageNumber: number, messageKey: Uint8Array) {
+  private async storeReceivedMessageKey(dhPublicKey: Uint8Array, messageNumber: number, messageKey: Uint8Array) {
     const cacheKey = this.getCacheKey(dhPublicKey);
     if (!this.messageKeyCache.has(cacheKey)) {
       this.messageKeyCache.set(cacheKey, new Map());
@@ -292,41 +308,62 @@ export class Ratchet {
     if (!this.remotePublicKey) {
       throw new Error("Ratchet not initialized. Call initialize() first");
     }
-
-    // Generate new DH key pair for every message ratchet
-    this.privateKey = secp256k1.utils.randomPrivateKey();
-    this.publicKey = secp256k1.getPublicKey(this.privateKey, false);
-
-    // Track this public key as one we used for sending
-    this.sentPublicKeys.add(uint8ArrayToHexString(this.publicKey));
-    if (this.verboseLog) console.log(`Generated new DH key pair for encrypting message.`, this.privateKey, this.remotePublicKey);
-
-    // Perform a Diffie-Hellman ratchet step
-    const sharedPoint = secp256k1.getSharedSecret(
-      this.privateKey,
-      this.remotePublicKey
-    );
-    const sharedSecret = sharedPoint.slice(1, 33);
-
-    if (!this.rootKey) {
-      throw new Error("Root key not initialized");
+    if (this.debugLog) {
+      console.log(`======== ENCRYPT ========`);
+      console.log(`isInitiator: ${this.isInitiator}`);
+      console.log(`needToRatchet: ${this.needToRatchet}`);
     }
 
-    // Update root key and derive the new send chain key
-    const { newRootKey, newChainKey } = await this.kdfRoot(
-      this.rootKey,
-      sharedSecret
-    );
-    this.rootKey = newRootKey;
-    this.sendChainKey = newChainKey;
+    if (this.needToRatchet) {
+      if (this.verboseLog) console.log("Generating new DH key pair due to ratchet step");
+      // Generate new DH key pair
+      this.currentDHPrivateKey = secp256k1.utils.randomPrivateKey();
+      this.currentDHPublicKey = secp256k1.getPublicKey(this.currentDHPrivateKey, false);
 
-    if (this.verboseLog) console.log(`New Root Key: ${Buffer.from(this.rootKey).toString("hex")}`);
-    if (this.verboseLog) console.log(
-      `New Send Chain Key: ${Buffer.from(this.sendChainKey).toString("hex")}`
-    );
+      // Track this public key as one we used for sending
+      if (this.verboseLog) console.log(`Generated new DH key pair for encrypting message.`,
+        Buffer.from(this.currentDHPublicKey).toString("hex"));
+
+      // Perform a Diffie-Hellman ratchet step
+      if (this.verboseLog) console.log(`Mixing with remote public key: ${Buffer.from(this.remotePublicKey).toString("hex")}`);
+      const sharedPoint = secp256k1.getSharedSecret(
+        this.currentDHPrivateKey,
+        this.remotePublicKey
+      );
+      if (this.debugLog) console.log(`Shared point: ${Buffer.from(sharedPoint).toString("hex")}`);
+      const sharedSecret = sharedPoint.slice(1, 33);
+
+      if (!this.rootKey) {
+        throw new Error("Root key not initialized");
+      }
+
+      // Update root key and derive the new send chain key
+      const {newRootKey, newChainKey} = await this.kdfRoot(
+        this.rootKey,
+        sharedSecret
+      );
+      this.rootKey = newRootKey;
+      this.sendChainKey = newChainKey;
+
+      // Reset message numbers for new chain
+      this.previousChainLength = this.sendMessageNumber;
+      this.sendMessageNumber = 0;
+      this.needToRatchet = false;
+
+
+      if (this.debugLog) console.log(`New Root Key: ${Buffer.from(this.rootKey).toString("hex")}`);
+      if (this.debugLog) console.log(
+        `New Send Chain Key: ${Buffer.from(this.sendChainKey).toString("hex")}`
+      );
+    } else {
+      if (this.verboseLog) console.log("Not ratcheting. Using existing send chain key");
+    }
 
     // Include message number in the packet
-    const messageNumber = this.sendMessageNumber++;
+    const messageNumber = this.sendMessageNumber;
+    this.sentPublicKeys.add(uint8ArrayToHexString(this.currentDHPublicKey));
+    this.sendMessageNumber++;
+    if (this.verboseLog) console.log(`send DH public key stored`)
 
     // Derive message key
     const messageKey = await this.kdfMessageKey(this.sendChainKey);
@@ -334,7 +371,11 @@ export class Ratchet {
       throw new Error("Derived message key length is invalid");
     }
     // Store the message key with the public key as cache key for later decryption
-    await this.storeSentMessageKey(this.publicKey, messageNumber, messageKey);
+    await this.storeSentMessageKey(this.currentDHPublicKey, messageNumber, messageKey);
+
+    // Advance the send chain key for the next message
+    this.sendChainKey = await this.kdfChainKey(this.sendChainKey);
+    if (this.debugLog) console.log(`Advancing send chain key for next message`, Buffer.from(this.sendChainKey).toString("hex"));
 
     // Generate a 12-byte IV for AES-GCM encryption
     const iv = this.crypto.getRandomValues(new Uint8Array(12));
@@ -342,10 +383,7 @@ export class Ratchet {
       throw new Error("IV length must be 12 bytes");
     }
 
-    if (this.verboseLog) console.log(
-      `Encrypting message with IV: ${Buffer.from(iv).toString("hex")}`
-    );
-    if (this.verboseLog) console.log(`Encrypting with message key: ${Buffer.from(messageKey).toString("hex")}`);
+    if (this.debugLog) console.log(`Encrypting with message key: ${Buffer.from(messageKey).toString("hex")} and messageNumber: ${messageNumber}`);
 
     // Import the message key for encryption
     const encKey = await this.subtle.importKey(
@@ -366,7 +404,7 @@ export class Ratchet {
     );
 
     return {
-      dhPublicKey: this.publicKey,
+      dhPublicKey: this.currentDHPublicKey,
       iv,
       ciphertext: new Uint8Array(encryptedData),
       messageNumber
@@ -395,39 +433,38 @@ export class Ratchet {
 
       if (this.isSentMessage(packet)) {
         if (this.verboseLog) console.log(`Decrypting own message #${packet.messageNumber}`);
-
         // Use the message's DH public key as cache key
         const cacheKey = uint8ArrayToHexString(packet.dhPublicKey);
-        if (this.verboseLog) console.log(`Cache key: ${cacheKey}`);
         const chainCache = this.sentMessageKeyCache.get(cacheKey);
         messageKey = chainCache?.get(packet.messageNumber);
 
         if (!messageKey) {
           throw new Error("Sent message key not found in cache");
         }
+        // Decrypt the message using the found message key
+        const decKey = await this.subtle.importKey(
+          "raw",
+          messageKey,
+          {name: "AES-GCM"},
+          false,
+          ["decrypt"]
+        );
+
+        const decryptedData = await this.subtle.decrypt(
+          {name: "AES-GCM", iv: packet.iv},
+          decKey,
+          packet.ciphertext
+        );
+
+        const decoder = new TextDecoder();
+        if (this.verboseLog) console.log('Decrypted completed for sent message');
+        return decoder.decode(decryptedData).trim();
       } else {
         if (this.verboseLog) console.log(`Decrypting received message #${packet.messageNumber}`);
         const decrypted = await this.decryptReceivedMessage(packet);
+        if (this.verboseLog) console.log('Decrypted completed for received message');
         return decrypted;
       }
-
-      // Decrypt the message using the found message key
-      const decKey = await this.subtle.importKey(
-        "raw",
-        messageKey,
-        {name: "AES-GCM"},
-        false,
-        ["decrypt"]
-      );
-
-      const decryptedData = await this.subtle.decrypt(
-        {name: "AES-GCM", iv: packet.iv},
-        decKey,
-        packet.ciphertext
-      );
-
-      const decoder = new TextDecoder();
-      return decoder.decode(decryptedData).trim();
     } catch (error) {
       console.error('Decryption failed:', error);
       throw new Error(
@@ -471,7 +508,7 @@ export class Ratchet {
         }
         // Store current state and throw error
         if (this.recvChainKey) {
-          await this.storeMessageKey(
+          await this.storeReceivedMessageKey(
             packet.dhPublicKey, // Use DH public key instead of chain key
             packet.messageNumber,
             await this.kdfMessageKey(this.recvChainKey)
@@ -483,14 +520,25 @@ export class Ratchet {
       // Handle DH ratchet step if needed
       if (keysAreDifferent) {
         if (this.verboseLog) {
-          console.log("Keys are different. Generating new shared secret and ratcheting.");
+          console.log("Sender's public keys are different. Generating new shared secret and ratcheting.");
+          console.log("Sender's newest public key:", uint8ArrayToHexString(packet.dhPublicKey));
+          if (this.debugLog) {
+            if (this.currentDHPublicKey) console.log("Our current public key:", uint8ArrayToHexString(this.currentDHPublicKey));
+            if (this.currentDHPrivateKey) console.log("Our current private key:", uint8ArrayToHexString(this.currentDHPrivateKey));
+          }
         }
+
+        if (this.currentDHPrivateKey === null) {
+          throw new Error("Current DH private key is not initialized");
+        }
+        this.remotePublicKey = packet.dhPublicKey;
 
         // Compute new shared secret using received public key and current private key
         const sharedPoint = secp256k1.getSharedSecret(
-          this.privateKey,
+          this.currentDHPrivateKey!,
           packet.dhPublicKey
         );
+        if (this.debugLog) console.log(`Shared point: ${Buffer.from(sharedPoint).toString("hex")}`);
         const sharedSecret = sharedPoint.slice(1, 33);
 
         if (!this.rootKey) {
@@ -501,7 +549,8 @@ export class Ratchet {
         const derivedKeys = await this.kdfRoot(this.rootKey, sharedSecret);
         this.rootKey = derivedKeys.newRootKey;
         this.recvChainKey = derivedKeys.newChainKey;
-        this.remotePublicKey = packet.dhPublicKey;
+
+        if (this.debugLog) console.log(`New ratchet keys: rootKey: ${uint8ArrayToHexString(this.rootKey)}, recvChainKey: ${uint8ArrayToHexString(this.recvChainKey)}`);
 
         // Store the length of the previous sending chain
         this.previousChainLength = this.sendMessageNumber;
@@ -512,6 +561,8 @@ export class Ratchet {
         if (!this.sendChainKey) {
           this.sendChainKey = await this.kdfChainKey(this.recvChainKey);
         }
+        // Set flag to generate new DH key pair before sending next message
+        this.needToRatchet = true;
       }
 
       // Try to find message key in cache first
@@ -520,11 +571,12 @@ export class Ratchet {
       let messageKey = chainCache?.get(packet.messageNumber);
 
       if (chainCache) {
-        if (this.verboseLog) {
+        if (this.debugLog) {
           console.log(`Message key found in cache for message #${packet.messageNumber} and publicKey: ${uint8ArrayToHexString(packet.dhPublicKey)}`);
         }
       }
 
+      //  If message key is not found in cache, derive it
       if (!messageKey) {
         if (!isFirstMessage && packet.messageNumber < this.recvMessageNumber) {
           // Restore previous state and try again
@@ -535,20 +587,20 @@ export class Ratchet {
 
         // Generate new message key and advance chain
         messageKey = await this.kdfMessageKey(this.recvChainKey!);
+        // todo: why  are we updating here?
         this.recvChainKey = await this.kdfChainKey(this.recvChainKey!);
         this.recvMessageNumber = packet.messageNumber + 1;
+        if (this.debugLog) console.log(`New receive chain key: ${uint8ArrayToHexString(this.recvChainKey)} and received message number: ${packet.messageNumber} messageKey: ${uint8ArrayToHexString(messageKey)}`);
 
         // Store the message key with DH public key as cache key
-        await this.storeMessageKey(packet.dhPublicKey, packet.messageNumber, messageKey);
-      } else {
-
+        await this.storeReceivedMessageKey(packet.dhPublicKey, packet.messageNumber, messageKey);
       }
 
       if (messageKey.length !== 32) {
         throw new Error("Derived message key length is invalid");
       }
 
-      if (this.verboseLog) {
+      if (this.debugLog) {
         console.log(`Decrypting with received chain key: ${
           Buffer.from(this.recvChainKey!).toString("hex")
         }`);
@@ -587,10 +639,12 @@ export class Ratchet {
         );
       }
 
-      // Revert to the previous state if decryption fails
-      this.rootKey = oldRootKey ? new Uint8Array(oldRootKey) : null;
-      this.recvChainKey = oldRecvChainKey ? new Uint8Array(oldRecvChainKey) : null;
-      this.remotePublicKey = oldRemotePublicKey ? new Uint8Array(oldRemotePublicKey) : null;
+      if (this.revertStateOnFailure) {
+        // Revert to the previous state if decryption fails
+        this.rootKey = oldRootKey ? new Uint8Array(oldRootKey) : new Uint8Array(32);
+        this.recvChainKey = oldRecvChainKey ? new Uint8Array(oldRecvChainKey) : new Uint8Array(32);
+        this.remotePublicKey = oldRemotePublicKey ? new Uint8Array(oldRemotePublicKey) : new Uint8Array(32);
+      }
 
       throw error;
     }
@@ -616,6 +670,7 @@ export class Ratchet {
         chainCache.delete(sortedKeys.shift()!);
       }
     }
+    if (this.verboseLog) console.log(`Stored sent message key for message #${messageNumber} with public key: ${uint8ArrayToHexString(dhPublicKey)}`);
   }
 
   // Add method to check if a message was sent by us
@@ -624,21 +679,79 @@ export class Ratchet {
   }
 
   public restoreState(state: RatchetState): void {
+    if (this.verboseLog) console.log('======== RESTORE STATE ========');
     if (!state) {
       throw new Error("No state provided for restoration");
     }
 
-    // Restore basic properties
-    this.rootKey = state.rootKey;
-    this.sendChainKey = state.sendChainKey;
-    this.recvChainKey = state.recvChainKey;
-    this.remotePublicKey = state.remotePublicKey;
+// Helper function to convert serialized object to Uint8Array
+    const toUint8Array = (data: any): Uint8Array => {
+      if (!data) return new Uint8Array(32);
+
+      // If it's already a Uint8Array, return a copy
+      if (data instanceof Uint8Array) {
+        return new Uint8Array(data);
+      }
+
+      // If it's a string (hex), convert from hex
+      if (typeof data === 'string') {
+        return new Uint8Array(Buffer.from(data, 'hex'));
+      }
+
+      // If it's an object with numeric keys (serialized Uint8Array)
+      if (typeof data === 'object' && !Array.isArray(data)) {
+        // Convert object with numeric keys to array
+        const arr = new Uint8Array(Object.keys(data).length);
+        for (let key in data) {
+          if (data.hasOwnProperty(key)) {
+            arr[parseInt(key)] = data[key];
+          }
+        }
+        return arr;
+      }
+
+      // If it's an array-like object
+      if (Array.isArray(data)) {
+        return new Uint8Array(data);
+      }
+
+      console.warn('Unknown data type for conversion:', data);
+      return new Uint8Array(32);
+    };
+
+    // Restore basic properties with proper Uint8Array conversion
+    this.rootKey = toUint8Array(state.rootKey);
+    this.sendChainKey = toUint8Array(state.sendChainKey);
+    this.recvChainKey = toUint8Array(state.recvChainKey);
+    this.remotePublicKey = toUint8Array(state.remotePublicKey);
+
+    // Restore message counters and flags
     this.sendMessageNumber = state.sendMessageNumber;
     this.recvMessageNumber = state.recvMessageNumber;
     this.previousChainLength = state.previousChainLength;
     this.needToRatchet = state.needToRatchet;
     this.isFirstMessage = state.isFirstMessage;
+    this.isInitiator = state.isInitiator;
     this.sentPublicKeys = new Set(state.sentPublicKeys);
+
+    // Restore DH keys with proper type conversion
+    if (state.currentDHPublicKey) {
+      this.currentDHPublicKey = toUint8Array(state.currentDHPublicKey);
+      if (this.debugLog) {
+        console.log(`Restoring DH public key from state: ${
+          this.currentDHPublicKey ? uint8ArrayToHexString(this.currentDHPublicKey) : 'null'
+        }`);
+      }
+    }
+
+    if (state.currentDHPrivateKey) {
+      this.currentDHPrivateKey = toUint8Array(state.currentDHPrivateKey);
+      if (this.debugLog) {
+        console.log(`Restoring DH private key from state: ${
+          this.currentDHPrivateKey ? uint8ArrayToHexString(this.currentDHPrivateKey) : 'null'
+        }`);
+      }
+    }
 
     // Restore message key caches
     this.messageKeyCache = new Map(
@@ -666,12 +779,12 @@ export class Ratchet {
       ])
     );
 
-    if (this.verboseLog) {
+    if (this.debugLog) {
       console.log('Restored ratchet state with caches:', {
-        rootKey: this.rootKey ? uint8ArrayToHexString(this.rootKey) : null,
-        sendChainKey: this.sendChainKey ? uint8ArrayToHexString(this.sendChainKey) : null,
-        recvChainKey: this.recvChainKey ? uint8ArrayToHexString(this.recvChainKey) : null,
-        remotePublicKey: this.remotePublicKey ? uint8ArrayToHexString(this.remotePublicKey) : null,
+        rootKey: this.rootKey ? uint8ArrayToHexString(this.rootKey) : new Uint8Array(32),
+        sendChainKey: this.sendChainKey ? uint8ArrayToHexString(this.sendChainKey) : new Uint8Array(32),
+        recvChainKey: this.recvChainKey ? uint8ArrayToHexString(this.recvChainKey) : new Uint8Array(32),
+        remotePublicKey: this.remotePublicKey ? uint8ArrayToHexString(this.remotePublicKey) : new Uint8Array(32),
         sendMessageNumber: this.sendMessageNumber,
         recvMessageNumber: this.recvMessageNumber,
         previousChainLength: this.previousChainLength,
@@ -679,7 +792,8 @@ export class Ratchet {
         isFirstMessage: this.isFirstMessage,
         sentPublicKeysCount: this.sentPublicKeys.size,
         messageKeyCacheSize: this.messageKeyCache.size,
-        sentMessageKeyCacheSize: this.sentMessageKeyCache.size
+        sentMessageKeyCacheSize: this.sentMessageKeyCache.size,
+        currentDHPublicKey: this.currentDHPublicKey,
       });
       console.log(`State after restoration:`, this.getState());
     }
@@ -723,24 +837,11 @@ export class Ratchet {
       previousChainLength: this.previousChainLength,
       sentPublicKeys: Array.from(this.sentPublicKeys),
       messageKeyCache,
-      sentMessageKeyCache
-    };
-  }
-
-  public cloneState(): RatchetState {
-    return {
-      rootKey: this.rootKey ? new Uint8Array(this.rootKey) : null,
-      sendChainKey: this.sendChainKey ? new Uint8Array(this.sendChainKey) : null,
-      recvChainKey: this.recvChainKey ? new Uint8Array(this.recvChainKey) : null,
-      remotePublicKey: this.remotePublicKey ? new Uint8Array(this.remotePublicKey) : null,
-      sendMessageNumber: this.sendMessageNumber,
-      recvMessageNumber: this.recvMessageNumber,
-      previousChainLength: this.previousChainLength,
-      needToRatchet: this.needToRatchet,
-      isFirstMessage: this.isFirstMessage,
-      sentPublicKeys: Array.from(this.sentPublicKeys),
-      messageKeyCache: this.getState().messageKeyCache, // Use getState to get serializable format
-      sentMessageKeyCache: this.getState().sentMessageKeyCache
+      sentMessageKeyCache,
+      // Include DH keys in state
+      currentDHPublicKey: this.currentDHPublicKey,
+      currentDHPrivateKey: this.currentDHPrivateKey,
+      isInitiator: this.isInitiator
     };
   }
 
